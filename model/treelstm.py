@@ -140,11 +140,12 @@ class BinaryTreeLSTM(nn.Module):
         length_mask = basic.sequence_mask(sequence_length=length,
                                           max_length=max_depth)
         select_masks = []
-
+        print(f"input size: {input.size}")
         if self.use_leaf_rnn:
             hs = []
             cs = []
             batch_size, max_length, _ = input.size()
+            print(f"max_length: {max_length}\nmax_depth: {max_depth}")
             zero_state = input.data.new_zeros(batch_size, self.hidden_dim)
             h_prev = c_prev = zero_state
             for i in range(max_length):
@@ -184,12 +185,73 @@ class BinaryTreeLSTM(nn.Module):
             state = self.word_linear(input)
             state = state.chunk(chunks=2, dim=2)
         nodes = []
+        # print(state[0].shape)
         if self.intra_attention:
             nodes.append(state[0])
         for i in range(max_depth - 1):
+            # print(i)
             h, c = state
             l = (h[:, :-1, :], c[:, :-1, :])
             r = (h[:, 1:, :], c[:, 1:, :])
+            print(h.shape)
+            print(l[0].shape)
+            print(r[0].shape)
+            new_state = self.treelstm_layer(l=l, r=r)
+            if i < max_depth - 2:
+                # We don't need to greedily select the composition in the
+                # last iteration, since it has only one option left.
+                new_h, new_c, select_mask, selected_h = self.select_composition(
+                    old_state=state, new_state=new_state,
+                    mask=length_mask[:, i+1:])
+                new_state = (new_h, new_c)
+                select_masks.append(select_mask)
+                if self.intra_attention:
+                    nodes.append(selected_h)
+            done_mask = length_mask[:, i+1]
+            state = self.update_state(old_state=state, new_state=new_state,
+                                      done_mask=done_mask)
+            if self.intra_attention and i >= max_depth - 2:
+                nodes.append(state[0])
+        h, c = state
+        if self.intra_attention:
+            att_mask = torch.cat([length_mask, length_mask[:, 1:]], dim=1)
+            att_mask = att_mask.float()
+            # nodes: (batch_size, num_tree_nodes, hidden_dim)
+            nodes = torch.cat(nodes, dim=1)
+            att_mask_expand = att_mask.unsqueeze(2).expand_as(nodes)
+            nodes = nodes * att_mask_expand
+            # nodes_mean: (batch_size, hidden_dim, 1)
+            nodes_mean = nodes.mean(1).squeeze(1).unsqueeze(2)
+            # att_weights: (batch_size, num_tree_nodes)
+            att_weights = torch.bmm(nodes, nodes_mean).squeeze(2)
+            att_weights = basic.masked_softmax(
+                logits=att_weights, mask=att_mask)
+            # att_weights_expand: (batch_size, num_tree_nodes, hidden_dim)
+            att_weights_expand = att_weights.unsqueeze(2).expand_as(nodes)
+            # h: (batch_size, 1, 2 * hidden_dim)
+            h = (att_weights_expand * nodes).sum(1)
+        assert h.size(1) == 1 and c.size(1) == 1
+        if not return_select_masks:
+            return h.squeeze(1), c.squeeze(1)
+        else:
+            return h.squeeze(1), c.squeeze(1), select_masks
+
+    def forward_with_branches(self, input_h, input_c, return_select_masks=False):
+        length = max_depth = input_h.size(1)
+        length_mask = basic.sequence_mask(sequence_length=length,
+                                          max_length=max_depth)
+        select_masks = []
+        state = (input_h, input_c)
+        nodes = []
+        # print(state[0].shape)
+        if self.intra_attention:
+            nodes.append(state[0])
+        for i in range(max_depth - 1):
+            print(i)
+            h, c = state
+            l = (h[:, :-1, :], c[:, :-1, :])
+            r = (h[:, 1:, :], c[:, 1:, :])
+            # print(l[0].shape)
             new_state = self.treelstm_layer(l=l, r=r)
             if i < max_depth - 2:
                 # We don't need to greedily select the composition in the
